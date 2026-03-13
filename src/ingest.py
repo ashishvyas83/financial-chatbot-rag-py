@@ -8,103 +8,187 @@ import time
 
 load_dotenv()
 
+# ─────────────────────────────────────────────
+# CONNECTIONS
+# ─────────────────────────────────────────────
+pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
+index = pc.Index(os.getenv("PINECONE_INDEX_NAME"))
+
+embedding_model = GoogleGenerativeAIEmbeddings(
+    model="models/gemini-embedding-001",
+    google_api_key=os.getenv("GEMINI_API_KEY")
+)
+
+
+# ─────────────────────────────────────────────
+# STEP 1: LOAD DOCUMENTS
+# ─────────────────────────────────────────────
 def load_documents():
-    print("Loading documents...")
-
-
+    print("📂 Loading documents...")
     loader = DirectoryLoader(
-        path="../documents",        # folder with our 4 txt files
-        glob="*.txt",               # only load .txt files
-        loader_cls=TextLoader       # use TextLoader for each file
+        "../documents",
+        glob="*.txt",
+        loader_cls=TextLoader
     )
-
     documents = loader.load()
-
-    print(f"Loaded {len(documents)} documents")
-
+    print(f"✅ Loaded {len(documents)} documents")
     for doc in documents:
-        print(f" -> {doc.metadata['source']}")
-
+        print(f"   → {doc.metadata['source']}")
     return documents
 
 
-def chunk_documents(documents):
-
-    print("\nChunking documents...")
-
-    # 1. VALIDATE before chunking
-    cleaned_documents = []
-    for doc in documents:
-        content = doc.page_content
-        
-        # Check if document looks readable
-        if len(content) == 0:
-            print(f"⚠️ Skipping empty document: {doc.metadata['source']}")
-            continue
-            
-        # Check if it has any spaces (basic readability check)
-        space_ratio = content.count(' ') / len(content)
-        if space_ratio < 0.05:   # less than 5% spaces = suspicious!
-            print(f"⚠️ Warning: {doc.metadata['source']} looks malformed")
-            # Still process it but warn the user
-            
-        cleaned_documents.append(doc)
+# ─────────────────────────────────────────────
+# STEP 2: CREATE PARENT-CHILD CHUNKS
+# ─────────────────────────────────────────────
+def create_parent_child_chunks(documents):
+    """
+    Parent = large chunks (full product sections)
+             Used for: sending to LLM as context
     
-    # 2. THEN chunk normally
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500,
+    Child  = small chunks (specific facts)
+             Used for: precise Pinecone search
+    """
+    print("\n✂️  Creating parent-child chunks...")
+
+    # Parent splitter — large, captures full sections
+    parent_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1500,     # large — full product section
+        chunk_overlap=150,   # generous overlap
+        separators=["\n\n", "\n", " ", ""]
+    )
+
+    # Child splitter — small, captures specific facts
+    child_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=400,      # small — specific facts
         chunk_overlap=50,
-        separators=["\n\n", "\n", " ", ""]  # "" = last resort force cut
+        separators=["\n\n", "\n", " ", ""]
     )
+
+    all_pairs = []
+    parent_count = 0
+    child_count = 0
+
+    for doc in documents:
+        source = doc.metadata['source']
+
+        # Create parent chunks from document
+        parents = parent_splitter.split_documents([doc])
+
+        for parent in parents:
+            parent_id = f"parent_{parent_count}"
+
+            # Create child chunks FROM this parent
+            children = child_splitter.split_documents([parent])
+
+            for child in children:
+                pair = {
+                    "child_id":    f"child_{child_count}",
+                    "child_text":  child.page_content,
+                    "parent_id":   parent_id,
+                    "parent_text": parent.page_content,
+                    "source":      source
+                }
+                all_pairs.append(pair)
+                child_count += 1
+
+            parent_count += 1
+
+    print(f"✅ Created {parent_count} parents → {child_count} children")
+
+    # Show a sample so we can verify!
+    print("\n--- Sample Parent (what LLM reads) ---")
+    print(f"Length: {len(all_pairs[0]['parent_text'])} chars")
+    print(all_pairs[0]['parent_text'][:300] + "...")
+
+    print("\n--- Sample Child (what we search) ---")
+    print(f"Length: {len(all_pairs[0]['child_text'])} chars")
+    print(all_pairs[0]['child_text'][:150] + "...")
+
+    return all_pairs
+
+
+# ─────────────────────────────────────────────
+# STEP 3: STORE IN PINECONE
+# ─────────────────────────────────────────────
+def store_in_pinecone(pairs):
+    """
+    Store CHILD embedding as vector
+    Store PARENT text in metadata
     
-    chunks = splitter.split_documents(cleaned_documents)
+    Search = child precision
+    Answer = parent context
+    """
+    print(f"\n🌲 Storing {len(pairs)} chunks in Pinecone...")
 
-    print(f"Created {len(chunks)} chunks from {len(documents)} documents")
+    # Clear existing vectors first!
+    print("🗑️  Clearing existing Pinecone data...")
+    index.delete(delete_all=True)
+    time.sleep(2)  # wait for deletion to complete
+    print("✅ Pinecone cleared!")
 
-    print("\n--- Sample Chunk ---")
-    print(f"Content: {chunks[0].page_content}")
-    print(f"Source:  {chunks[0].metadata['source']}")
-    print(f"Length:  {len(chunks[0].page_content)} characters")
+    stored = 0
+    for i, pair in enumerate(pairs):
 
-    return chunks
+        # Embed the CHILD text (small, precise)
+        child_embedding = embedding_model.embed_query(
+            pair["child_text"]
+        )
 
-
-def store_chunks_in_pinecone(chunks):
-    pc=Pinecone(appi_key=os.getenv("PINECONE_API_KEY"))
-    index=pc.Index(os.getenv("PINECONE_INDEX_NAME"))
-
-    print("Generating embeddings and storing in Pinecone...")
-
-    embedding_model = GoogleGenerativeAIEmbeddings(
-        model="models/gemini-embedding-001",
-        google_api_key=os.getenv("GEMINI_API_KEY")
-    )
-
-    stored=0
-
-    for i, chunk in enumerate(chunks):
-        embedding = embedding_model.embed_query(chunk.page_content)
-
+        # Store with PARENT text in metadata!
         index.upsert(vectors=[{
-            "id": f"chunk_{i}",
-            "values": embedding,
+            "id": pair["child_id"],
+            "values": child_embedding,      # child vector
             "metadata": {
-                "text": chunk.page_content,
-                "source": chunk.metadata["source"]
+                # For searching context display
+                "child_text":  pair["child_text"],
+
+                # For LLM context — THE KEY PART! 🔑
+                "parent_text": pair["parent_text"],
+                "parent_id":   pair["parent_id"],
+
+                # For reference
+                "source":      pair["source"]
             }
         }])
 
         stored += 1
+        print(f"   ✅ {pair['child_id']} → {pair['parent_id']} "
+              f"({pair['source'].split(chr(92))[-1]})")
 
-        print(f"  Stored chunk {i+1}/{len(chunks)} from {chunk.metadata['source']}")
-        
-        # Small delay to avoid rate limiting
+        # Rate limiting protection
         time.sleep(0.5)
-    
-    print(f"\n✅ Successfully stored {stored} chunks in Pinecone!")
-    return index
+
+    print(f"\n🎉 Successfully stored {stored} chunks!")
+    print(f"   Each with parent context for better answers!")
 
 
-documents = load_documents()
-chunks = chunk_documents(documents)
-index = store_chunks_in_pinecone(chunks)
+# ─────────────────────────────────────────────
+# STEP 4: VERIFY
+# ─────────────────────────────────────────────
+def verify_pinecone():
+    """Quick verification that data is stored"""
+    print("\n🔍 Verifying Pinecone storage...")
+    time.sleep(2)  # wait for indexing
+
+    stats = index.describe_index_stats()
+    print(f"✅ Total vectors in Pinecone: "
+          f"{stats['total_vector_count']}")
+
+
+# ─────────────────────────────────────────────
+# RUN EVERYTHING
+# ─────────────────────────────────────────────
+if __name__ == "__main__":
+    print("🚀 Starting Parent-Child Ingestion Pipeline")
+    print("=" * 50)
+
+    documents = load_documents()
+    pairs = create_parent_child_chunks(documents)
+    store_in_pinecone(pairs)
+    verify_pinecone()
+
+    print("\n✅ Ingestion Complete!")
+    print(f"   → Documents loaded:  4")
+    print(f"   → Parent chunks:     check output above")
+    print(f"   → Child chunks:      check output above")
+    print(f"   → Ready for search!  🎯")
